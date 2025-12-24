@@ -1,0 +1,50 @@
+diff --git a/src/llvm_jit_context.cpp b/src/llvm_jit_context.cpp
+index 1234567..abcdefg 100644
+--- a/src/llvm_jit_context.cpp
++++ b/src/llvm_jit_context.cpp
+@@ -296,6 +296,25 @@ llvm_bpf_jit_context::~llvm_bpf_jit_context()
+ 	pthread_spin_destroy(compiling.get());
+ }
+
++// APX configuration accessors (defined in apx-jit module if available)
++// These default to standard x86-64 if APX module is not linked
++extern "C" {
++__attribute__((weak)) const char* bpftime_get_apx_cpu_target() {
++    return "generic";
++}
++__attribute__((weak)) const char* bpftime_get_apx_features() {
++    return "";
++}
++__attribute__((weak)) bool bpftime_is_apx_active() {
++    return false;
++}
++}
++
++static std::string get_effective_cpu() {
++    return bpftime_get_apx_cpu_target();
++}
++
++static std::string get_effective_features() {
++    return bpftime_get_apx_features();
++}
++
+ std::vector<uint8_t> llvm_bpf_jit_context::do_aot_compile(
+ 	const std::vector<std::string> &extFuncNames,
+ 	const std::vector<std::string> &lddwHelpers, bool print_ir)
+@@ -314,9 +333,13 @@ std::vector<uint8_t> llvm_bpf_jit_context::do_aot_compile(
+ 			SPDLOG_ERROR(
+ 				"AOT: Failed to get local target: {}",
+ 				error);
+ 			throw std::runtime_error(
+ 				"Unable to get local target");
+ 		}
++		// Use APX-aware CPU target and features if available
++		std::string cpu = get_effective_cpu();
++		std::string features = get_effective_features();
++		SPDLOG_INFO("AOT: Using CPU={}, features={}", cpu, features);
+ 		auto targetMachine = target->createTargetMachine(
+-			defaultTargetTriple, "generic", "",
++			defaultTargetTriple, cpu, features,
+ 			TargetOptions(), Reloc::PIC_);
+ 		if (!targetMachine) {
+ 			SPDLOG_ERROR("Unable to create target machine");
