@@ -36,6 +36,7 @@ void cpuid(uint32_t leaf, uint32_t subleaf, uint32_t regs[4]) {
 
 /**
  * @brief Get XCR0 value (Extended Control Register 0)
+ * Uses inline assembly to avoid requiring -mxsave compiler flag
  */
 uint64_t get_xcr0() {
     uint32_t regs[4];
@@ -48,7 +49,10 @@ uint64_t get_xcr0() {
         return 0;
     }
 
-    return _xgetbv(0);
+    // Use inline assembly for XGETBV to avoid -mxsave requirement
+    uint32_t eax, edx;
+    asm volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0));
+    return ((uint64_t)edx << 32) | eax;
 }
 #endif
 

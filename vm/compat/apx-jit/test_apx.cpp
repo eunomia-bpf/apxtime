@@ -10,8 +10,6 @@
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <cpuid.h>
-#include <immintrin.h>
-#include <x86intrin.h>
 #endif
 
 // CPUID constants
@@ -37,7 +35,10 @@ uint64_t get_xcr0() {
     cpuid(1, 0, regs);
     bool has_osxsave = (regs[2] >> 27) & 1;
     if (!has_osxsave) return 0;
-    return _xgetbv(0);
+    // Use inline assembly for XGETBV to avoid -mxsave requirement
+    uint32_t eax, edx;
+    asm volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0));
+    return ((uint64_t)edx << 32) | eax;
 }
 #endif
 

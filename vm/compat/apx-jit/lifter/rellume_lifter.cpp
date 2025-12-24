@@ -23,6 +23,13 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/IR/LegacyPassManager.h>
 
+// LLVM 18+ uses different header for getDefaultTargetTriple
+#if LLVM_VERSION_MAJOR >= 18
+#include <llvm/TargetParser/Host.h>
+#else
+#include <llvm/Support/Host.h>
+#endif
+
 #if __has_include(<rellume/rellume.h>)
 #include <rellume/rellume.h>
 #define HAVE_RELLUME 1
@@ -32,8 +39,192 @@
 
 #include <mutex>
 #include <unordered_map>
+#include <sys/mman.h>
 
 namespace bpftime::vm::apx {
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+// APX register indices (R16-R31 follow after R0-R15)
+constexpr int REG_R16 = 16;
+constexpr int REG_R23 = 23;
+constexpr int REG_R31 = 31;
+
+// XSAVE state component mask for APX extended state
+constexpr uint64_t XSAVE_APX_MASK = (1ULL << 19);  // APX state component
+
+// ============================================================================
+// SelectiveXSaveManager - Manages XSAVE/XRSTOR for APX registers
+// ============================================================================
+
+class SelectiveXSaveManager {
+public:
+    SelectiveXSaveManager() {
+        // Allocate aligned buffer for XSAVE
+        xsave_buffer_ = aligned_alloc(64, XSAVE_BUFFER_SIZE);
+        if (xsave_buffer_) {
+            memset(xsave_buffer_, 0, XSAVE_BUFFER_SIZE);
+        }
+    }
+
+    ~SelectiveXSaveManager() {
+        if (xsave_buffer_) {
+            free(xsave_buffer_);
+        }
+    }
+
+    /**
+     * @brief Compute XSAVE mask based on which APX registers are used
+     */
+    static uint64_t compute_xsave_mask(const std::unordered_set<int>& regs_used) {
+        if (regs_used.empty()) {
+            return 0;
+        }
+        // If any R16-R31 are used, we need APX state component
+        for (int reg : regs_used) {
+            if (reg >= REG_R16 && reg <= REG_R31) {
+                return XSAVE_APX_MASK;
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * @brief Save APX state before executing translated code
+     */
+    void save_apx_state(uint64_t cpu_state_addr, uint32_t modified_mask) {
+        if (!xsave_buffer_) return;
+
+#if defined(__x86_64__) && defined(__GNUC__)
+        // Use XSAVE64 with selective mask
+        uint32_t eax = static_cast<uint32_t>(XSAVE_APX_MASK);
+        uint32_t edx = static_cast<uint32_t>(XSAVE_APX_MASK >> 32);
+
+        asm volatile(
+            "xsave64 %0"
+            : "=m"(*static_cast<char*>(xsave_buffer_))
+            : "a"(eax), "d"(edx)
+            : "memory"
+        );
+#endif
+        SPDLOG_TRACE("Saved APX state, mask: {:#x}", modified_mask);
+    }
+
+    /**
+     * @brief Restore APX state after executing translated code
+     */
+    void restore_apx_state(uint64_t cpu_state_addr, uint32_t modified_mask) {
+        if (!xsave_buffer_) return;
+
+#if defined(__x86_64__) && defined(__GNUC__)
+        uint32_t eax = static_cast<uint32_t>(XSAVE_APX_MASK);
+        uint32_t edx = static_cast<uint32_t>(XSAVE_APX_MASK >> 32);
+
+        asm volatile(
+            "xrstor64 %0"
+            :
+            : "m"(*static_cast<const char*>(xsave_buffer_)), "a"(eax), "d"(edx)
+            : "memory"
+        );
+#endif
+        SPDLOG_TRACE("Restored APX state, mask: {:#x}", modified_mask);
+    }
+
+private:
+    static constexpr size_t XSAVE_BUFFER_SIZE = 8192;  // Should be enough for APX state
+    void* xsave_buffer_ = nullptr;
+};
+
+// ============================================================================
+// APXCodeCache - Caches translated code with executable memory
+// ============================================================================
+
+class APXCodeCache {
+public:
+    explicit APXCodeCache(size_t max_size) : max_size_(max_size) {
+        // Allocate executable memory region
+        code_region_ = mmap(nullptr, max_size,
+                           PROT_READ | PROT_WRITE | PROT_EXEC,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (code_region_ == MAP_FAILED) {
+            code_region_ = nullptr;
+            SPDLOG_ERROR("Failed to allocate executable memory for code cache");
+        }
+    }
+
+    ~APXCodeCache() {
+        if (code_region_) {
+            munmap(code_region_, max_size_);
+        }
+    }
+
+    /**
+     * @brief Lookup cached code by original address
+     */
+    void* lookup(uint64_t original_addr) {
+        auto it = cache_.find(original_addr);
+        if (it != cache_.end()) {
+            return it->second.code_ptr;
+        }
+        return nullptr;
+    }
+
+    /**
+     * @brief Insert translated code into cache
+     */
+    void* insert(uint64_t original_addr, const uint8_t* code, size_t size, uint64_t xsave_mask) {
+        if (!code_region_ || current_offset_ + size > max_size_) {
+            SPDLOG_ERROR("Code cache full or not initialized");
+            return nullptr;
+        }
+
+        // Copy code to executable region
+        void* code_ptr = static_cast<uint8_t*>(code_region_) + current_offset_;
+        memcpy(code_ptr, code, size);
+        current_offset_ += size;
+
+        // Align to 16 bytes
+        current_offset_ = (current_offset_ + 15) & ~15ULL;
+
+        // Store in cache
+        CacheEntry entry{code_ptr, size, xsave_mask};
+        cache_[original_addr] = entry;
+
+        return code_ptr;
+    }
+
+    /**
+     * @brief Get XSAVE mask for cached code
+     */
+    uint64_t get_xsave_mask(uint64_t original_addr) {
+        auto it = cache_.find(original_addr);
+        if (it != cache_.end()) {
+            return it->second.xsave_mask;
+        }
+        return 0;
+    }
+
+    /**
+     * @brief Invalidate cached code
+     */
+    void invalidate(uint64_t original_addr) {
+        cache_.erase(original_addr);
+    }
+
+private:
+    struct CacheEntry {
+        void* code_ptr;
+        size_t size;
+        uint64_t xsave_mask;
+    };
+
+    void* code_region_ = nullptr;
+    size_t max_size_;
+    size_t current_offset_ = 0;
+    std::unordered_map<uint64_t, CacheEntry> cache_;
+};
 
 // ============================================================================
 // RellumeLifter Implementation
@@ -90,6 +281,7 @@ public:
 
                     // For now, mark R16-R19 as potentially usable
                     // Real implementation would do proper register allocation
+                    (void)inst;  // Suppress unused warning
                 }
             }
         }
@@ -117,6 +309,7 @@ public:
 
         // This is done at the LLVM IR level by identifying
         // copy-then-operate patterns
+        (void)module;  // Suppress unused warning
 
         SPDLOG_DEBUG("Applied NDD optimization pass");
     }
@@ -129,6 +322,7 @@ public:
         // the NF variant to avoid EFLAGS updates
 
         // This requires liveness analysis on EFLAGS
+        (void)module;  // Suppress unused warning
 
         SPDLOG_DEBUG("Applied NF (flag suppression) optimization pass");
     }
@@ -180,6 +374,9 @@ std::optional<APXLiftResult> RellumeLifter::lift_buffer(const uint8_t* code,
                                                          uint64_t base_addr,
                                                          llvm::LLVMContext& context) {
     APXLiftResult result;
+    (void)code;
+    (void)code_size;
+    (void)base_addr;
 
 #if HAVE_RELLUME
     // Use Rellume for lifting
@@ -225,9 +422,11 @@ std::optional<APXLiftResult> RellumeLifter::lift_buffer(const uint8_t* code,
     result.module = std::make_unique<llvm::Module>("stub", context);
 
     // Create a simple function that just returns
+    // LLVM 18+ uses opaque pointers, so use PointerType::get instead of getInt8PtrTy
+    auto* ptr_type = llvm::PointerType::get(context, 0);
     auto* func_type = llvm::FunctionType::get(
         llvm::Type::getVoidTy(context),
-        {llvm::Type::getInt8PtrTy(context)},
+        {ptr_type},
         false);
 
     result.entry_function = llvm::Function::Create(
