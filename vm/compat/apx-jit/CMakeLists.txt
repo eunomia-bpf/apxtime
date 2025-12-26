@@ -47,6 +47,7 @@ endif()
 set(APX_JIT_SOURCES
   apx_cpu_features.cpp
   compat_apx_llvm.cpp
+  apx_hotpath_manager.cpp
 )
 
 # Add lifter sources
@@ -131,6 +132,7 @@ install(TARGETS bpftime_apx_jit
 install(FILES
   apx_cpu_features.hpp
   compat_apx_llvm.hpp
+  apx_hotpath_manager.hpp
   lifter/rellume_lifter.hpp
   DESTINATION include/bpftime/apx
 )

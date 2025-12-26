@@ -104,10 +104,20 @@ private:
     // Error message storage
     std::string error_msg_;
 
+    // Program ID for hot path tracking (assigned after successful APX wrap)
+    uint32_t program_id_ = 0;
+
     /**
      * @brief Initialize the APX-configured LLVM backend
      */
     void initialize_apx_backend();
+
+public:
+    /**
+     * @brief Get the program ID for hot path tracking
+     * @return Program ID (0 if not APX-wrapped)
+     */
+    uint32_t get_program_id() const { return program_id_; }
 };
 
 /**

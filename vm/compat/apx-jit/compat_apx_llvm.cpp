@@ -4,10 +4,18 @@
  * All rights reserved.
  *
  * APX-aware LLVM JIT backend implementation
+ *
+ * This integrates APX optimization into bpftime's JIT pipeline:
+ * 1. eBPF bytecode is compiled by LLVM JIT
+ * 2. JIT output is lifted back to LLVM IR (via Rellume)
+ * 3. APX optimizations are applied (R16-R31, NDD, NF)
+ * 4. APX-enabled code is emitted and cached
+ * 5. Hot paths are transparently routed to APX version
  */
 
 #include "compat_apx_llvm.hpp"
 #include "apx_cpu_features.hpp"
+#include "apx_hotpath_manager.hpp"
 #include <spdlog/spdlog.h>
 #include <bpftime_vm_compat.hpp>
 
@@ -33,7 +41,36 @@ namespace {
 thread_local std::string tls_apx_features;
 thread_local std::string tls_apx_cpu;
 
+// Program ID counter for hot path tracking
+std::atomic<uint32_t> g_program_id_counter{1};
+
 } // anonymous namespace
+
+// ============================================================================
+// APX Hot Path Integration
+// ============================================================================
+
+/**
+ * @brief Initialize APX hot path manager with default config
+ */
+static APXHotPathManager& get_apx_manager() {
+    static APXHotPathConfig config = []() {
+        APXHotPathConfig c;
+        c.hot_threshold = 100;          // Lower threshold for eBPF
+        c.enable_apx = true;
+        c.enable_ndd = true;
+        c.enable_nf = true;
+        c.selective_xsave = true;
+        c.verbose_logging = false;
+        return c;
+    }();
+    static APXHotPathManager manager(config);
+    static std::once_flag init_flag;
+    std::call_once(init_flag, [&]() {
+        manager.initialize();
+    });
+    return manager;
+}
 
 bpftime_apx_llvm_vm::bpftime_apx_llvm_vm() {
     initialize_apx_backend();
@@ -183,8 +220,44 @@ std::optional<compat::precompiled_ebpf_function> bpftime_apx_llvm_vm::compile() 
 
     auto result = inner_vm_->compile();
 
-    if (result.has_value() && apx_active_) {
-        SPDLOG_DEBUG("APX JIT: JIT compilation completed with APX optimizations");
+    if (!result.has_value()) {
+        return std::nullopt;
+    }
+
+    // If APX is active, wrap the JIT function with APX hot path manager
+    if (apx_active_ && apx_features_.can_use_apx()) {
+        auto& manager = get_apx_manager();
+
+        // Get function pointer from result (precompiled_ebpf_function is a function pointer type)
+        auto func_ptr = *result;
+
+        if (func_ptr) {
+            // Assign a unique program ID
+            uint32_t prog_id = g_program_id_counter++;
+
+            // Register with hot path manager for potential APX re-optimization
+            // The manager will lift the x86-64 JIT output back to IR,
+            // apply APX optimizations, and cache the result
+            size_t func_size = 4096;  // Estimate; could be improved with symbol info
+
+            void* apx_func = manager.wrap_ebpf_jit(
+                reinterpret_cast<void*>(func_ptr), func_size, prog_id);
+
+            if (apx_func && apx_func != reinterpret_cast<void*>(func_ptr)) {
+                // Successfully created APX-optimized version
+                // Update the result to use APX function
+                result = reinterpret_cast<compat::precompiled_ebpf_function>(apx_func);
+
+                SPDLOG_INFO("APX JIT: eBPF program {} wrapped with APX optimization", prog_id);
+
+                // Store program ID for later execution tracking
+                program_id_ = prog_id;
+            } else {
+                SPDLOG_DEBUG("APX JIT: Using standard JIT output (APX lift failed or unavailable)");
+            }
+        }
+    } else if (apx_active_) {
+        SPDLOG_DEBUG("APX JIT: JIT compilation completed with APX target features");
     }
 
     return result;

@@ -275,6 +275,89 @@ The XSAVE mask is computed to include only the APX state component:
 - AVX/AVX-512: Only if used
 - APX (R16-R31): Only if modified
 
+## Hot Path Manager
+
+The APX Hot Path Manager provides transparent APX optimization for frequently-executed code paths. It automatically:
+
+1. **Profiles execution frequency** - Tracks how often code regions are executed
+2. **Lifts hot paths** - Uses Rellume to lift x86-64 code to LLVM IR
+3. **Applies APX optimizations** - Uses R16-R31, NDD, NF where beneficial
+4. **Caches APX code** - Stores optimized code in executable memory
+5. **Transparently routes** - Patches original code to use APX version
+
+### Hot Path API Usage
+
+```cpp
+#include "apx_hotpath_manager.hpp"
+
+using namespace bpftime::vm::apx;
+
+// Configure hot path detection
+APXHotPathConfig config;
+config.hot_threshold = 1000;    // Executions before "hot"
+config.enable_apx = true;
+config.enable_ndd = true;       // 3-operand forms
+config.enable_nf = true;        // Flag suppression
+config.selective_xsave = true;  // Only save modified regs
+
+// Create and initialize manager
+APXHotPathManager manager(config);
+manager.initialize();
+
+// Register a code region to monitor
+uint64_t region_id = manager.register_region(func_addr, func_size, "my_function");
+
+// Set up code read callback
+manager.set_code_read_callback([](uint64_t addr, uint8_t* buf, size_t len) {
+    memcpy(buf, (void*)addr, len);
+    return true;
+});
+
+// In your execution loop
+void* exec_ptr = manager.on_execute(region_id);
+if (exec_ptr != original_func) {
+    // Using APX-optimized version!
+    auto optimized_func = (FuncType)exec_ptr;
+    result = optimized_func(args);
+}
+
+// Get statistics
+auto stats = manager.get_stats();
+std::cout << "Hot path hits: " << stats.hot_path_hits << std::endl;
+std::cout << "APX optimizations: " << stats.apx_optimizations_applied << std::endl;
+```
+
+### eBPF JIT Integration
+
+The hot path manager integrates with bpftime's VM execution:
+
+```cpp
+// The APX VM automatically wraps JIT output
+auto vm = bpftime::vm::compat::create_vm_instance("apx_llvm");
+vm->load_code(ebpf_code, code_len);
+
+// Compile - automatically APX-optimized if available
+auto func = vm->compile();
+
+// Execute - uses APX version on supported CPUs
+uint64_t result;
+vm->exec(memory, mem_len, result);
+```
+
+### Testing with Intel SDE
+
+Test APX hot path optimization on non-APX hardware using Intel SDE:
+
+```bash
+# Build the example
+g++ -std=c++20 -O2 -o example_apx_hotpath example_apx_hotpath.cpp \
+    -lbpftime_apx_jit -lspdlog -lpthread
+
+# Run with APX emulation (Diamond Rapids or future)
+sde64 -dmr -- ./example_apx_hotpath
+sde64 -future -- ./example_apx_hotpath
+```
+
 ## Files
 
 ```
@@ -285,8 +368,10 @@ vm/compat/apx-jit/
 ├── apx_cpu_features.cpp        # APX detection implementation
 ├── compat_apx_llvm.hpp         # APX LLVM VM header
 ├── compat_apx_llvm.cpp         # APX LLVM VM implementation
-├── apx_jit_context.hpp         # APX JIT context header
-├── llvmbpf_apx_support.patch   # Patch for llvmbpf submodule
+├── apx_hotpath_manager.hpp     # Hot path manager header
+├── apx_hotpath_manager.cpp     # Hot path manager implementation
+├── example_apx_hotpath.cpp     # Hot path example/demo
+├── test_apx.cpp                # Standalone APX detection test
 ├── lifter/
 │   ├── rellume_lifter.hpp      # Rellume integration header
 │   └── rellume_lifter.cpp      # Rellume integration + APX passes
