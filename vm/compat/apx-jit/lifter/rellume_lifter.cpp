@@ -26,8 +26,10 @@
 // LLVM 18+ uses different header for getDefaultTargetTriple
 #if LLVM_VERSION_MAJOR >= 18
 #include <llvm/TargetParser/Host.h>
+#include <llvm/TargetParser/Triple.h>
 #else
 #include <llvm/Support/Host.h>
+#include <llvm/ADT/Triple.h>
 #endif
 
 #if __has_include(<rellume/rellume.h>)
@@ -487,14 +489,16 @@ std::vector<uint8_t> RellumeLifter::generate_apx_code(llvm::Module& module,
 
     // Create target machine with APX features
     std::string error;
-    auto triple = llvm::sys::getDefaultTargetTriple();
-    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, error);
+    auto triple_str = llvm::sys::getDefaultTargetTriple();
+    llvm::Triple triple(triple_str);
+    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple_str, error);
 
     if (!target) {
         SPDLOG_ERROR("Failed to get target: {}", error);
         return result;
     }
 
+#if LLVM_VERSION_MAJOR >= 22
     auto target_machine = std::unique_ptr<llvm::TargetMachine>(
         target->createTargetMachine(
             triple,
@@ -502,6 +506,15 @@ std::vector<uint8_t> RellumeLifter::generate_apx_code(llvm::Module& module,
             feature_str,
             llvm::TargetOptions(),
             llvm::Reloc::PIC_));
+#else
+    auto target_machine = std::unique_ptr<llvm::TargetMachine>(
+        target->createTargetMachine(
+            triple_str,
+            cpu,
+            feature_str,
+            llvm::TargetOptions(),
+            llvm::Reloc::PIC_));
+#endif
 
     if (!target_machine) {
         SPDLOG_ERROR("Failed to create target machine");
@@ -510,7 +523,11 @@ std::vector<uint8_t> RellumeLifter::generate_apx_code(llvm::Module& module,
 
     // Set data layout
     module.setDataLayout(target_machine->createDataLayout());
+#if LLVM_VERSION_MAJOR >= 22
     module.setTargetTriple(triple);
+#else
+    module.setTargetTriple(triple_str);
+#endif
 
     // Run optimization passes
     llvm::LoopAnalysisManager LAM;

@@ -141,3 +141,6 @@ install(FILES
 if(BPFTIME_ENABLE_UNIT_TESTING)
   add_subdirectory(test)
 endif()
+
+# Benchmarks
+add_subdirectory(benchmark)
